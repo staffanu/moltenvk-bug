@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
-# Run the 4 (or 5) variants and print a compact summary.
+# Run the variant matrix and print a compact summary.
 set -euo pipefail
 cd "$(dirname "$0")"
 
-# Locate validation layer manifest from a Homebrew-installed loader + LunarG SDK setup.
 if [[ -z "${VK_LAYER_PATH:-}" ]]; then
     sdk_glob=(/Users/staffanu/VulkanSDK/*/macOS/share/vulkan/explicit_layer.d)
     if [[ -d "${sdk_glob[0]}" ]]; then
@@ -19,19 +18,33 @@ if [[ ! -x "$BIN" ]]; then
 fi
 
 run_one() {
-    local barrier="$1" layout="$2"
+    local label="$1"; shift
     echo "============================================================"
-    echo "VARIANT barrier=$barrier layout=$layout iterations=$ITER"
+    echo "VARIANT $label  iterations=$ITER"
+    echo "  $BIN $* --iterations=$ITER"
     echo "============================================================"
-    "$BIN" --barrier="$barrier" --layout="$layout" --iterations="$ITER" || true
+    "$BIN" "$@" --iterations="$ITER" || true
     echo
 }
 
-run_one BUFFER SHARED
-run_one BUFFER SEPARATE
-run_one MEMORY SHARED
-run_one MEMORY SEPARATE
+# Original 4-variant matrix (single frame, single thread, no extras).
+run_one "1: BUFFER + SHARED"   --barrier=BUFFER --layout=SHARED
+run_one "2: BUFFER + SEPARATE" --barrier=BUFFER --layout=SEPARATE
+run_one "3: MEMORY + SHARED"   --barrier=MEMORY --layout=SHARED
+run_one "4: MEMORY + SEPARATE" --barrier=MEMORY --layout=SEPARATE
 
 if [[ "${INCLUDE_NONE:-0}" == "1" ]]; then
-    run_one NONE SEPARATE
+    run_one "5: NONE + SEPARATE" --barrier=NONE --layout=SEPARATE
+fi
+
+# Extended matrix: pipelined + threaded reader, with and without neighbours.
+if [[ "${EXTENDED:-1}" == "1" ]]; then
+    run_one "6: pipelined frames=3"                         --barrier=BUFFER --layout=SHARED   --frames-in-flight=3
+    run_one "7: pipelined frames=3 + threaded-reader"       --barrier=BUFFER --layout=SHARED   --frames-in-flight=3 --threaded-reader
+    run_one "8: pipelined frames=3 + threaded + MEMORY"     --barrier=MEMORY --layout=SHARED   --frames-in-flight=3 --threaded-reader
+    run_one "9: pipelined + threaded + neighbours=4"        --barrier=BUFFER --layout=SHARED   --frames-in-flight=3 --threaded-reader --neighbours=4
+    run_one "10: cmd-split + pipelined + threaded"          --barrier=BUFFER --layout=SHARED   --frames-in-flight=3 --threaded-reader --cmd-split
+    run_one "11: SEPARATE + pipelined + threaded"           --barrier=BUFFER --layout=SEPARATE --frames-in-flight=3 --threaded-reader
+    run_one "12: kitchen sink (BUFFER)"                     --barrier=BUFFER --layout=SHARED   --frames-in-flight=3 --threaded-reader --neighbours=4 --cmd-split
+    run_one "13: kitchen sink (MEMORY)"                     --barrier=MEMORY --layout=SHARED   --frames-in-flight=3 --threaded-reader --neighbours=4 --cmd-split
 fi
