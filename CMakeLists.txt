@@ -31,6 +31,13 @@ target_compile_definitions(repro PRIVATE
     SHADER_SPV_PATH="${SHADER_SPV}"
 )
 
+add_executable(minimal_repro minimal_repro.cpp)
+add_dependencies(minimal_repro shader)
+target_link_libraries(minimal_repro PRIVATE Vulkan::Vulkan)
+target_compile_definitions(minimal_repro PRIVATE
+    SHADER_SPV_PATH="${SHADER_SPV}"
+)
+
 if(APPLE)
     # MoltenVK requires the portability enumeration extension at instance level.
     target_compile_definitions(repro PRIVATE USE_PORTABILITY_ENUMERATION=1)
