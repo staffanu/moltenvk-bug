@@ -38,6 +38,10 @@ target_compile_definitions(minimal_repro PRIVATE
     SHADER_SPV_PATH="${SHADER_SPV}"
 )
 
+# tiny_repro: no shader, no compute, no descriptors -- just vkCmdFillBuffer.
+add_executable(tiny_repro tiny_repro.cpp)
+target_link_libraries(tiny_repro PRIVATE Vulkan::Vulkan)
+
 if(APPLE)
     # MoltenVK requires the portability enumeration extension at instance level.
     target_compile_definitions(repro PRIVATE USE_PORTABILITY_ENUMERATION=1)

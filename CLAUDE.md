@@ -31,6 +31,21 @@ VK_LAYER_PATH=~/VulkanSDK/1.4.309.0/macOS/share/vulkan/explicit_layer.d \
   ./build/repro --barrier=BUFFER --layout=SHARED --iterations=10000
 ```
 
+## The three programs
+
+- `repro` (built from `main.cpp`, ~770 LOC) — full matrix harness with all the
+  flags. Use this for sweeping variants.
+- `minimal_repro` (built from `minimal_repro.cpp`, ~310 LOC) — hardcoded failing
+  shape: 2 frames in flight, BUFFER barrier, SHARED `VkDeviceMemory`, threaded
+  reader, compute shader writes B = A xor 0xA5A5A5A5. Validation opt-in via
+  `REPRO_VALIDATION=1`.
+- `tiny_repro` (built from `tiny_repro.cpp`, ~240 LOC) — smallest reproducer.
+  No compute pipeline, no shader, no descriptors. Just `vkCmdCopyBuffer(A->B)`
+  with two pipelined frames sharing one `VkDeviceMemory` and a reader thread
+  doing `vkInvalidateMappedMemoryRanges`. Reproduces at ~35% per iteration.
+
+`tiny_repro` is the file to attach to a MoltenVK bug report.
+
 ## Variant matrix
 
 | Variant | --barrier | --layout |
