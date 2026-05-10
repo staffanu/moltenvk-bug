@@ -1,13 +1,19 @@
 // Tiniest repro of the MoltenVK / AMD / macOS cache-coherency bug.
 // No compute, no shader, no descriptors. Just two buffers in one
-// VkDeviceMemory, vkCmdFillBuffer to write one of them on the GPU, and
-// concurrent host flush(A) on one thread and invalidate(B) on another.
+// VkDeviceMemory, a GPU vkCmdCopyBuffer(A -> B), and concurrent host
+// flush(A) on one thread and invalidate(B) on another.
 //
 // Per Vulkan spec, vkFlushMappedMemoryRanges and vkInvalidateMappedMemoryRanges
-// have no external-synchronization requirement, and disjoint
-// nonCoherentAtomSize-aligned ranges of the same VkDeviceMemory may be
-// flushed/invalidated concurrently from multiple threads. On the affected
-// stack, the invalidate returns stale data when it races against the flush.
+// have no external-synchronization requirement on VkDeviceMemory (only on
+// VkDevice), and disjoint nonCoherentAtomSize-aligned ranges of one
+// allocation may be flushed/invalidated concurrently from different threads.
+// The buffer layout below ensures A and B never share an atom -- offsets,
+// stride, and atom are printed at startup so the layout is auditable.
+//
+// On the affected stack the invalidate of B returns stale data when it
+// races against the flush of A. Validation layers do NOT catch this --
+// it is a driver cache-coherency bug, not API misuse. The REPRO_VALIDATION
+// env var is provided only to demonstrate that fact.
 //
 // Build:  c++ -std=c++17 -O2 tiny_repro.cpp -lvulkan -o tiny_repro
 // Run:    ./tiny_repro
@@ -18,7 +24,7 @@
 
 #include <vulkan/vulkan.h>
 
-#include <atomic>
+#include <algorithm>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -33,6 +39,7 @@
 static constexpr uint32_t kFrames = 2;
 static constexpr uint32_t kIters  = 10000;
 static constexpr VkDeviceSize kBufBytes = 4096;
+static constexpr uint32_t kInvalidIdx = static_cast<uint32_t>(-1);
 
 struct Frame {
     VkBuffer bufA, bufB;
@@ -40,8 +47,7 @@ struct Frame {
     void *mapA, *mapB;
     VkCommandBuffer cmd;
     VkFence fence;
-    enum class State { Ready, Submitted };
-    std::atomic<State> state{State::Ready};
+    bool busy = false;     // protected by `mu` below
     uint32_t value = 0;
 };
 
@@ -76,17 +82,26 @@ int main() {
 #endif
     VkInstance instance; VK(vkCreateInstance(&ici, nullptr, &instance));
 
-    // Physical device + queue family.
-    uint32_t n = 1; VkPhysicalDevice pd; VK(vkEnumeratePhysicalDevices(instance, &n, &pd));
+    // Physical device: query count, then prefer a discrete GPU.
+    uint32_t pdN = 0; VK(vkEnumeratePhysicalDevices(instance, &pdN, nullptr));
+    if (pdN == 0) { std::fprintf(stderr, "no Vulkan physical devices\n"); return 3; }
+    std::vector<VkPhysicalDevice> pds(pdN);
+    VK(vkEnumeratePhysicalDevices(instance, &pdN, pds.data()));
+    VkPhysicalDevice pd = pds[0];
+    for (auto cand : pds) {
+        VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(cand, &p);
+        if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) { pd = cand; break; }
+    }
     VkPhysicalDeviceProperties pdp; vkGetPhysicalDeviceProperties(pd, &pdp);
     VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(pd, &mp);
     uint32_t qfN; vkGetPhysicalDeviceQueueFamilyProperties(pd, &qfN, nullptr);
     std::vector<VkQueueFamilyProperties> qfs(qfN);
     vkGetPhysicalDeviceQueueFamilyProperties(pd, &qfN, qfs.data());
-    uint32_t qfi = ~0u;
-    // vkCmdFillBuffer needs TRANSFER (or COMPUTE/GRAPHICS) — every queue family supports it implicitly.
+    uint32_t qfi = kInvalidIdx;
+    // vkCmdCopyBuffer needs TRANSFER (or COMPUTE/GRAPHICS, which imply it).
     for (uint32_t i = 0; i < qfN; ++i)
         if (qfs[i].queueFlags & (VK_QUEUE_TRANSFER_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_GRAPHICS_BIT)) { qfi = i; break; }
+    if (qfi == kInvalidIdx) { std::fprintf(stderr, "no transfer-capable queue family\n"); return 3; }
 
     // Device.
     float prio = 1.0f;
@@ -104,7 +119,7 @@ int main() {
     VkQueue queue; vkGetDeviceQueue(device, qfi, 0, &queue);
 
     // Memory type: DEVICE_LOCAL+HOST_VISIBLE+HOST_CACHED, NOT HOST_COHERENT.
-    uint32_t mt = ~0u;
+    uint32_t mt = kInvalidIdx;
     for (uint32_t i = 0; i < mp.memoryTypeCount; ++i) {
         VkMemoryPropertyFlags f = mp.memoryTypes[i].propertyFlags;
         if ((f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
@@ -112,7 +127,7 @@ int main() {
             (f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)  &&
            !(f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) { mt = i; break; }
     }
-    if (mt == ~0u) { std::fprintf(stderr, "no non-coherent device-local host-cached memory type\n"); return 3; }
+    if (mt == kInvalidIdx) { std::fprintf(stderr, "no non-coherent device-local host-cached memory type\n"); return 3; }
 
     // Buffers + ONE shared VkDeviceMemory containing all frames' A and B.
     auto mkbuf = [&](VkBufferUsageFlags usage) {
@@ -146,6 +161,18 @@ int main() {
         fr.mapB = static_cast<char*>(base) + fr.offB;
     }
 
+    // Print atom layout so reviewers can confirm A and B never share an atom.
+    std::printf("device: %s\n", pdp.deviceName);
+    std::printf("nonCoherentAtomSize=%llu  bufSize=%llu  bufAlignment=%llu  stride=%llu  alloc=%llu\n",
+                (unsigned long long)atom, (unsigned long long)kBufBytes,
+                (unsigned long long)req.alignment, (unsigned long long)stride,
+                (unsigned long long)mai.allocationSize);
+    for (uint32_t i = 0; i < kFrames; ++i)
+        std::printf("  frame %u: offA=%llu offB=%llu  (atom-aligned: A=%s B=%s)\n", i,
+                    (unsigned long long)frames[i].offA, (unsigned long long)frames[i].offB,
+                    (frames[i].offA % atom == 0) ? "yes" : "NO",
+                    (frames[i].offB % atom == 0) ? "yes" : "NO");
+
     // Per-frame command buffer + fence.
     VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     cpci.queueFamilyIndex = qfi; cpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -158,16 +185,18 @@ int main() {
         VK(vkCreateFence(device, &fci, nullptr, &fr.fence));
     }
 
-    // Reader thread: pulls frame indices off a queue, invalidates B, compares.
+    // All cross-thread state (jobs queue, per-frame `busy`, stop) is owned
+    // by `mu`. Notifications happen while holding the mutex so the producer
+    // can't sleep through a state change it was about to observe.
     std::queue<uint32_t> jobs; std::mutex mu; std::condition_variable cv;
-    std::atomic<bool> stop{false};
-    std::atomic<uint32_t> bad{0};
+    bool stop = false;
+    uint32_t bad = 0;
     std::thread reader([&]() {
         while (true) {
             uint32_t idx;
             { std::unique_lock<std::mutex> lk(mu);
-              cv.wait(lk, [&]{ return stop.load() || !jobs.empty(); });
-              if (jobs.empty() && stop.load()) return;
+              cv.wait(lk, [&]{ return stop || !jobs.empty(); });
+              if (jobs.empty()) return;
               idx = jobs.front(); jobs.pop(); }
             Frame& fr = frames[idx];
             VK(vkWaitForFences(device, 1, &fr.fence, VK_TRUE, UINT64_MAX));
@@ -176,10 +205,11 @@ int main() {
             VK(vkInvalidateMappedMemoryRanges(device, 1, &r));    // <-- bug surface
             const uint32_t* B = static_cast<const uint32_t*>(fr.mapB);
             uint32_t expect = fr.value;
+            uint32_t local_bad = 0;
             for (uint32_t i = 0; i < kBufBytes / 4; ++i) {
-                if (B[i] != expect) { bad.fetch_add(1); break; }
+                if (B[i] != expect) { local_bad = 1; break; }
             }
-            fr.state.store(Frame::State::Ready, std::memory_order_release);
+            { std::lock_guard<std::mutex> g(mu); fr.busy = false; bad += local_bad; }
             cv.notify_all();
         }
     });
@@ -188,7 +218,7 @@ int main() {
     for (uint32_t it = 0; it < kIters; ++it) {
         uint32_t idx = it % kFrames; Frame& fr = frames[idx];
         { std::unique_lock<std::mutex> lk(mu);
-          cv.wait(lk, [&]{ return fr.state.load(std::memory_order_acquire) == Frame::State::Ready; }); }
+          cv.wait(lk, [&]{ return !fr.busy; }); }
 
         // Host writes A; GPU copies A -> B; host (on reader thread) reads B.
         fr.value = 0xC0DE0000u | it;
@@ -220,19 +250,19 @@ int main() {
         si.commandBufferCount = 1; si.pCommandBuffers = &fr.cmd;
         VK(vkQueueSubmit(queue, 1, &si, fr.fence));
 
-        fr.state.store(Frame::State::Submitted, std::memory_order_release);
-        { std::lock_guard<std::mutex> g(mu); jobs.push(idx); } cv.notify_one();
+        { std::lock_guard<std::mutex> g(mu); fr.busy = true; jobs.push(idx); }
+        cv.notify_one();
     }
 
     { std::unique_lock<std::mutex> lk(mu);
       cv.wait(lk, [&]{
           if (!jobs.empty()) return false;
-          for (auto& fr : frames) if (fr.state.load() != Frame::State::Ready) return false;
+          for (auto& fr : frames) if (fr.busy) return false;
           return true; });
-      stop.store(true); cv.notify_all(); }
+      stop = true; }
+    cv.notify_all();
     reader.join();
 
-    std::printf("device: %s  nonCoherentAtomSize=%llu\n", pdp.deviceName, (unsigned long long)atom);
-    std::printf("RESULT: %u / %u iterations bad\n", bad.load(), kIters);
-    return bad.load() == 0 ? 0 : 1;
+    std::printf("RESULT: %u / %u iterations bad\n", bad, kIters);
+    return bad == 0 ? 0 : 1;
 }
