@@ -27,7 +27,7 @@ INCLUDE_NONE=1 ./run-matrix.sh        # also run the no-barrier variant
 Or one variant at a time:
 
 ```
-VK_LAYER_PATH=~/VulkanSDK/1.4.309.0/macOS/share/vulkan/explicit_layer.d \
+VK_LAYER_PATH=~/VulkanSDK/1.4.341.1/macOS/share/vulkan/explicit_layer.d \
   ./build/repro --barrier=BUFFER --layout=SHARED --iterations=10000
 ```
 

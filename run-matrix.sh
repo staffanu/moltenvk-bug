@@ -5,8 +5,10 @@ cd "$(dirname "$0")"
 
 if [[ -z "${VK_LAYER_PATH:-}" ]]; then
     sdk_glob=(/Users/staffanu/VulkanSDK/*/macOS/share/vulkan/explicit_layer.d)
-    if [[ -d "${sdk_glob[0]}" ]]; then
-        export VK_LAYER_PATH="${sdk_glob[0]}"
+    # Pick the highest-versioned SDK (last alphabetically).
+    sdk_layer="${sdk_glob[${#sdk_glob[@]}-1]}"
+    if [[ -d "$sdk_layer" ]]; then
+        export VK_LAYER_PATH="$sdk_layer"
     fi
 fi
 
