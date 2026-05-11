@@ -1,7 +1,33 @@
 // Minimal repro of the MoltenVK / AMD / macOS cache-coherency bug.
-// No compute, no shader, no descriptors. Just two buffers in one
-// VkDeviceMemory, a GPU vkCmdCopyBuffer(A -> B), and concurrent host
-// flush(A) on one thread and invalidate(B) on another.
+//
+// What the test does
+// ------------------
+// Two threads share kFrames (2) pipelined Vulkan frames. Each frame owns
+// two buffers, A and B, sub-allocated from a single VkDeviceMemory.
+//
+// Main thread (per iteration):
+//   1. Waits until the frame slot is free (previous reader finished).
+//   2. Writes a unique 32-bit pattern into A's mapped memory.
+//   3. Records vkCmdCopyBuffer(A -> B) into the frame's command buffer,
+//      followed by a TRANSFER_WRITE -> HOST_READ pipeline barrier on B.
+//   4. Calls vkFlushMappedMemoryRanges on A's range (makes the host write
+//      visible to the GPU).
+//   5. Submits the command buffer with a per-frame fence, marks the frame
+//      busy, and pushes its index onto the jobs queue.
+//
+// Reader thread (one dedicated thread, runs concurrently):
+//   1. Pops a frame index from the jobs queue.
+//   2. Waits on the frame's fence (GPU copy of A->B is complete).
+//   3. Calls vkInvalidateMappedMemoryRanges on B's range.  <-- bug surface
+//   4. Reads B and checks every word against the expected pattern.
+//   5. Marks the frame free.
+//
+// The race: step 4 (main thread flush of A, frame N+kFrames) and
+// step 3 (reader thread invalidate of B, frame N) execute concurrently
+// against different, atom-aligned, non-overlapping ranges of the same
+// VkDeviceMemory. Per spec this is legal. On the affected stack the
+// invalidate returns stale data -- B reads back what the slot held in
+// the previous round rather than the current GPU output.
 //
 // Per Vulkan spec, vkFlushMappedMemoryRanges and vkInvalidateMappedMemoryRanges
 // have no external-synchronization requirement on VkDeviceMemory (only on
@@ -10,14 +36,13 @@
 // The buffer layout below ensures A and B never share an atom -- offsets,
 // stride, and atom are printed at startup so the layout is auditable.
 //
-// On the affected stack the invalidate of B returns stale data when it
-// races against the flush of A. Validation layers do NOT catch this --
-// it is a driver cache-coherency bug, not API misuse. The REPRO_VALIDATION
-// env var is provided only to demonstrate that fact.
+// Validation layers do NOT catch this -- it is a driver cache-coherency
+// bug, not API misuse. REPRO_VALIDATION=1 loads the validation layer to
+// confirm it stays silent.
 //
 // Build:  c++ -std=c++17 -O2 minimal_repro.cpp -lvulkan -o minimal_repro
-// Run:    ./tiny_repro
-//         REPRO_VALIDATION=1 VK_LAYER_PATH=... ./tiny_repro   (optional)
+// Run:    ./minimal_repro
+//         REPRO_VALIDATION=1 VK_LAYER_PATH=... ./minimal_repro   (optional)
 //
 // Affected stack: thousands of mismatches per 10000 iterations.
 // Working stack:  0/10000.
