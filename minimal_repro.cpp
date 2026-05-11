@@ -16,7 +16,6 @@
 
 #include <vulkan/vulkan.h>
 
-#include <atomic>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -47,8 +46,7 @@ struct Frame {
     VkCommandBuffer cmd;
     VkFence fence;
     VkDescriptorSet ds;
-    enum class State { Ready, Submitted };
-    std::atomic<State> state{State::Ready};
+    bool busy = false;   // protected by `mu` below
     uint32_t base = 0;
 };
 
@@ -217,15 +215,15 @@ int main() {
 
     // ---- Reader thread: pulls frame indices off a queue, invalidates B, compares ----
     std::queue<uint32_t> jobs; std::mutex mu; std::condition_variable cv;
-    std::atomic<bool> stop{false};
-    std::atomic<uint32_t> bad{0};
+    bool stop = false;
+    uint32_t bad = 0;
 
     std::thread reader([&]() {
         while (true) {
             uint32_t idx;
             { std::unique_lock<std::mutex> lk(mu);
-              cv.wait(lk, [&]{ return stop.load() || !jobs.empty(); });
-              if (jobs.empty() && stop.load()) return;
+              cv.wait(lk, [&]{ return stop || !jobs.empty(); });
+              if (jobs.empty()) return;
               idx = jobs.front(); jobs.pop(); }
             Frame& fr = frames[idx];
             VK(vkWaitForFences(device, 1, &fr.fence, VK_TRUE, UINT64_MAX));
@@ -234,11 +232,12 @@ int main() {
             VK(vkInvalidateMappedMemoryRanges(device, 1, &r));    // <-- the suspect call
 
             const uint32_t* B = static_cast<const uint32_t*>(fr.mappedB);
+            uint32_t local_bad = 0;
             for (uint32_t i = 0; i < kElems; ++i) {
                 uint32_t expect = (fr.base + i) ^ 0xA5A5A5A5u;
-                if (B[i] != expect) { bad.fetch_add(1); break; }
+                if (B[i] != expect) { local_bad = 1; break; }
             }
-            fr.state.store(Frame::State::Ready, std::memory_order_release);
+            { std::lock_guard<std::mutex> g(mu); fr.busy = false; bad += local_bad; }
             cv.notify_all();
         }
     });
@@ -248,7 +247,7 @@ int main() {
         uint32_t idx = it % kFrames; Frame& fr = frames[idx];
 
         { std::unique_lock<std::mutex> lk(mu);
-          cv.wait(lk, [&]{ return fr.state.load(std::memory_order_acquire) == Frame::State::Ready; }); }
+          cv.wait(lk, [&]{ return !fr.busy; }); }
 
         fr.base = it * 0x01010101u;
         uint32_t* A = static_cast<uint32_t*>(fr.mappedA);
@@ -291,21 +290,21 @@ int main() {
         si.commandBufferCount = 1; si.pCommandBuffers = &fr.cmd;
         VK(vkQueueSubmit(queue, 1, &si, fr.fence));
 
-        fr.state.store(Frame::State::Submitted, std::memory_order_release);
-        { std::lock_guard<std::mutex> g(mu); jobs.push(idx); } cv.notify_one();
+        { std::lock_guard<std::mutex> g(mu); fr.busy = true; jobs.push(idx); } cv.notify_one();
     }
 
     // Drain.
     { std::unique_lock<std::mutex> lk(mu);
       cv.wait(lk, [&]{
           if (!jobs.empty()) return false;
-          for (auto& fr : frames) if (fr.state.load() != Frame::State::Ready) return false;
+          for (auto& fr : frames) if (fr.busy) return false;
           return true; });
-      stop.store(true); cv.notify_all(); }
+      stop = true; }
+    cv.notify_all();
     reader.join();
 
     std::printf("device: %s  nonCoherentAtomSize=%llu\n",
                 pdp.deviceName, (unsigned long long)atom);
-    std::printf("RESULT: %u / %u iterations bad\n", bad.load(), kIters);
-    return bad.load() == 0 ? 0 : 1;
+    std::printf("RESULT: %u / %u iterations bad\n", bad, kIters);
+    return bad == 0 ? 0 : 1;
 }
