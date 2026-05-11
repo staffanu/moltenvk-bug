@@ -31,16 +31,16 @@ target_compile_definitions(repro PRIVATE
     SHADER_SPV_PATH="${SHADER_SPV}"
 )
 
-add_executable(minimal_repro minimal_repro.cpp)
-add_dependencies(minimal_repro shader)
-target_link_libraries(minimal_repro PRIVATE Vulkan::Vulkan)
-target_compile_definitions(minimal_repro PRIVATE
+add_executable(compute_repro compute_repro.cpp)
+add_dependencies(compute_repro shader)
+target_link_libraries(compute_repro PRIVATE Vulkan::Vulkan)
+target_compile_definitions(compute_repro PRIVATE
     SHADER_SPV_PATH="${SHADER_SPV}"
 )
 
-# tiny_repro: no shader, no compute, no descriptors -- just vkCmdFillBuffer.
-add_executable(tiny_repro tiny_repro.cpp)
-target_link_libraries(tiny_repro PRIVATE Vulkan::Vulkan)
+# minimal_repro: no shader, no compute, no descriptors -- just vkCmdCopyBuffer.
+add_executable(minimal_repro minimal_repro.cpp)
+target_link_libraries(minimal_repro PRIVATE Vulkan::Vulkan)
 
 if(APPLE)
     # MoltenVK requires the portability enumeration extension at instance level.
